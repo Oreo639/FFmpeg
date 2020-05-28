@@ -99,6 +99,44 @@ static const AVClass flavor ## _muxer_class = {\
     .version    = LIBAVUTIL_VERSION_INT,\
 };
 
+
+static const struct ogg_pcm_codec {
+    enum AVCodecID codec_id;
+    uint32_t format_id;
+} ogg_pcm_codecs[] = {
+    { AV_CODEC_ID_PCM_S8,    0x00 },
+    { AV_CODEC_ID_PCM_U8,    0x01 },
+    { AV_CODEC_ID_PCM_S16LE, 0x02 },
+    { AV_CODEC_ID_PCM_S16BE, 0x03 },
+    { AV_CODEC_ID_PCM_S24LE, 0x04 },
+    { AV_CODEC_ID_PCM_S24BE, 0x05 },
+    { AV_CODEC_ID_PCM_S32LE, 0x06 },
+    { AV_CODEC_ID_PCM_S32BE, 0x07 },
+    { AV_CODEC_ID_PCM_F32LE, 0x20 },
+    { AV_CODEC_ID_PCM_F32BE, 0x21 },
+    { AV_CODEC_ID_PCM_F64LE, 0x22 },
+    { AV_CODEC_ID_PCM_F64BE, 0x23 },
+};
+
+static inline uint32_t ogg_get_pcm_format_id(enum AVCodecID codec_id)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(ogg_pcm_codecs); i++)
+        if (ogg_pcm_codecs[i].codec_id == codec_id)
+            return ogg_pcm_codecs[i].format_id;
+
+    return 0;
+}
+
+static inline int ogg_pcm_fmt_supported(enum AVCodecID codec_id)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(ogg_pcm_codecs); i++)
+        if (ogg_pcm_codecs[i].codec_id == codec_id)
+            return 1;
+
+    return AV_CODEC_ID_NONE;
+
+}
+
 static void ogg_write_page(AVFormatContext *s, OGGPage *page, int extra_flags)
 {
     OGGStreamContext *oggstream = s->streams[page->stream_index]->priv_data;
@@ -363,6 +401,39 @@ static int ogg_build_speex_headers(AVCodecParameters *par,
     return 0;
 }
 
+#define OGGPCM_HEADER_SIZE 224
+
+static int ogg_build_pcm_headers(AVCodecParameters *par,
+                                 OGGStreamContext *oggstream, int bitexact,
+                                 AVDictionary **m)
+{
+    uint8_t *p;
+
+    // first packet: OggPCM header
+    p = av_mallocz(OGGPCM_HEADER_SIZE);
+    if (!p)
+        return AVERROR(ENOMEM);
+    oggstream->header[0] = p;
+    oggstream->header_len[0] = OGGPCM_HEADER_SIZE;
+    bytestream_put_buffer(&p, "PCM     ", 8); // Identifier
+    bytestream_put_be16(&p, 0x00); // VMAJ
+    bytestream_put_be16(&p, 0x00); // VMIN
+    bytestream_put_be32(&p, ogg_get_pcm_format_id(par->codec_id)); // PCM fmt
+    bytestream_put_be32(&p, par->sample_rate); // Sample rate
+    bytestream_put_byte(&p, par->bits_per_raw_sample); // Significant bits
+    bytestream_put_byte(&p, par->channels); // Channels
+    bytestream_put_be16(&p, MAX_PAGE_SIZE); // Max frames per packet
+    bytestream_put_be32(&p, 0); // Number of extra headers
+
+    // second packet: VorbisComment
+    p = ogg_write_vorbiscomment(0, bitexact, &oggstream->header_len[1], m, 0, NULL, 0);
+    if (!p)
+        return AVERROR(ENOMEM);
+    oggstream->header[1] = p;
+
+    return 0;
+}
+
 #define OPUS_HEADER_SIZE 19
 
 static int ogg_build_opus_headers(AVCodecParameters *par,
@@ -487,18 +558,20 @@ static int ogg_init(AVFormatContext *s)
                 avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
         }
 
-        if (st->codecpar->codec_id != AV_CODEC_ID_VORBIS &&
-            st->codecpar->codec_id != AV_CODEC_ID_THEORA &&
-            st->codecpar->codec_id != AV_CODEC_ID_SPEEX  &&
-            st->codecpar->codec_id != AV_CODEC_ID_FLAC   &&
-            st->codecpar->codec_id != AV_CODEC_ID_OPUS   &&
+        if (st->codecpar->codec_id != AV_CODEC_ID_VORBIS   &&
+            st->codecpar->codec_id != AV_CODEC_ID_THEORA   &&
+            st->codecpar->codec_id != AV_CODEC_ID_SPEEX    &&
+            st->codecpar->codec_id != AV_CODEC_ID_FLAC     &&
+            st->codecpar->codec_id != AV_CODEC_ID_OPUS     &&
+            !ogg_pcm_fmt_supported(st->codecpar->codec_id) &&
             st->codecpar->codec_id != AV_CODEC_ID_VP8) {
             av_log(s, AV_LOG_ERROR, "Unsupported codec id in stream %d\n", i);
             return AVERROR(EINVAL);
         }
 
         if ((!st->codecpar->extradata || !st->codecpar->extradata_size) &&
-            st->codecpar->codec_id != AV_CODEC_ID_VP8) {
+            st->codecpar->codec_id != AV_CODEC_ID_VP8  &&
+            !ogg_pcm_fmt_supported(st->codecpar->codec_id)) {
             av_log(s, AV_LOG_ERROR, "No extradata present\n");
             return AVERROR_INVALIDDATA;
         }
@@ -551,6 +624,14 @@ static int ogg_init(AVFormatContext *s)
                                             s->flags & AVFMT_FLAG_BITEXACT);
             if (err) {
                 av_log(s, AV_LOG_ERROR, "Error writing VP8 headers\n");
+                return err;
+            }
+        } else if (ogg_pcm_fmt_supported(st->codecpar->codec_id)) {
+            int err = ogg_build_pcm_headers(st->codecpar, oggstream,
+                                            s->flags & AVFMT_FLAG_BITEXACT,
+                                            &st->metadata);
+            if (err) {
+                av_log(s, AV_LOG_ERROR, "Error writing OggPCM headers\n");
                 return err;
             }
         } else {
@@ -729,6 +810,7 @@ static void ogg_free(AVFormatContext *s)
         if (st->codecpar->codec_id == AV_CODEC_ID_FLAC ||
             st->codecpar->codec_id == AV_CODEC_ID_SPEEX ||
             st->codecpar->codec_id == AV_CODEC_ID_OPUS ||
+            !ogg_pcm_fmt_supported(st->codecpar->codec_id) ||
             st->codecpar->codec_id == AV_CODEC_ID_VP8) {
             av_freep(&oggstream->header[0]);
         }
